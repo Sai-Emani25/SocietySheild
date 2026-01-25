@@ -1,0 +1,18 @@
+
+version: '3.8'
+
+services:
+  societyshield:
+    build: .
+    container_name: societyshield_app
+    ports:
+      - "3000:80"
+    environment:
+      - API_KEY=${API_KEY}
+    restart: always
+    networks:
+      - security_net
+
+networks:
+  security_net:
+    driver: bridge

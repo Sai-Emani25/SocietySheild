@@ -1,0 +1,9 @@
+{
+  "name": "SocietyShield Alert",
+  "description": "An AI-powered emergency notification system for residential societies that reduces response times from 15 minutes to under 30 seconds using sensor-based detection.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
