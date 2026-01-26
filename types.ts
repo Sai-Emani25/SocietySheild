@@ -1,4 +1,3 @@
-
 export enum AlertSeverity {
   LOW = 'LOW',
   MEDIUM = 'MEDIUM',
@@ -47,4 +46,15 @@ export interface EmergencyAlert {
   status: 'ACTIVE' | 'RESOLVED' | 'VERIFYING';
   description: string;
   triggeredBy: string; // User ID
+}
+
+export interface Complaint {
+  id: string;
+  subject: string;
+  description: string;
+  createdAt: Date;
+  createdBy: string;
+  reporterName: string;
+  groupId: string;
+  status: 'OPEN' | 'CLOSED';
 }

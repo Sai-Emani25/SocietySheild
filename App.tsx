@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { AlertType, AlertSeverity, EmergencyAlert, User, Group, Camera } from './types';
+import { AlertType, AlertSeverity, EmergencyAlert, User, Group, Camera, Complaint } from './types';
 import CommandCenter from './components/ShakeSimulator';
 import CameraMonitor from './components/CameraMonitor';
 import AlertHistory from './components/AlertHistory';
@@ -32,6 +32,8 @@ async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: 
 
 const STORAGE_KEY = 'SOCIETY_SHIELD_ALERTS_V2';
 const GROUPS_STORAGE_KEY = 'SOCIETY_SHIELD_GROUPS_V1';
+const COMPLAINTS_STORAGE_KEY = 'SOCIETY_SHIELD_COMPLAINTS_V1';
+const BANNED_STORAGE_KEY = 'SOCIETY_SHIELD_BANNED_V1';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -41,7 +43,19 @@ const App: React.FC = () => {
       const raw = localStorage.getItem(GROUPS_STORAGE_KEY);
       if (!raw) return [];
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((g: Group) => {
+        if (!Array.isArray(g.members) || g.members.length === 0) {
+          const hubId = g.id;
+          const trialMembers: User[] = [
+            { id: hubId + '_trial1', name: 'Trial Member 1', email: '', role: 'USER', groupId: hubId },
+            { id: hubId + '_trial2', name: 'Trial Member 2', email: '', role: 'USER', groupId: hubId },
+            { id: hubId + '_trial3', name: 'Trial Member 3', email: '', role: 'USER', groupId: hubId },
+          ];
+          return { ...g, members: trialMembers };
+        }
+        return g;
+      });
     } catch {
       return [];
     }
@@ -56,6 +70,51 @@ const App: React.FC = () => {
   const [newCam, setNewCam] = useState({ name: '', url: '', key: '' });
   const [isLinking, setIsLinking] = useState(false);
   const [activeCameraIndex, setActiveCameraIndex] = useState(0);
+  const [complaintsByGroup, setComplaintsByGroup] = useState<Record<string, Complaint[]>>(() => {
+    try {
+      const raw = localStorage.getItem(COMPLAINTS_STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const fixed: Record<string, Complaint[]> = {};
+        Object.entries(parsed).forEach(([groupId, value]) => {
+          if (Array.isArray(value)) {
+            fixed[groupId] = (value as any[]).map((c: any) => ({
+              ...c,
+              createdAt: new Date(c.createdAt),
+              status: c.status === 'CLOSED' ? 'CLOSED' : 'OPEN',
+            }));
+          }
+        });
+        return fixed;
+      }
+      return {};
+    } catch {
+      return {};
+    }
+  });
+  const [complaintSubject, setComplaintSubject] = useState('');
+  const [complaintDescription, setComplaintDescription] = useState('');
+  const [expandedComplaintId, setExpandedComplaintId] = useState<string | null>(null);
+  const [bannedByGroup, setBannedByGroup] = useState<Record<string, string[]>>(() => {
+    try {
+      const raw = localStorage.getItem(BANNED_STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const fixed: Record<string, string[]> = {};
+        Object.entries(parsed).forEach(([groupId, value]) => {
+          if (Array.isArray(value)) {
+            fixed[groupId] = (value as any[]).map((v) => String(v));
+          }
+        });
+        return fixed;
+      }
+      return {};
+    } catch {
+      return {};
+    }
+  });
   
   // Persistent Alerts State (per hub)
   const [alertsByGroup, setAlertsByGroup] = useState<Record<string, EmergencyAlert[]>>(() => {
@@ -105,6 +164,14 @@ const App: React.FC = () => {
   useEffect(() => {
     localStorage.setItem(GROUPS_STORAGE_KEY, JSON.stringify(joinedGroups));
   }, [joinedGroups]);
+
+  useEffect(() => {
+    localStorage.setItem(COMPLAINTS_STORAGE_KEY, JSON.stringify(complaintsByGroup));
+  }, [complaintsByGroup]);
+
+  useEffect(() => {
+    localStorage.setItem(BANNED_STORAGE_KEY, JSON.stringify(bannedByGroup));
+  }, [bannedByGroup]);
 
   useEffect(() => {
     activeAlertsRef.current = activeAlerts;
@@ -522,6 +589,61 @@ const App: React.FC = () => {
     setAuthStep('ONBOARDING');
   };
 
+  const currentComplaints: Complaint[] = activeGroup ? (complaintsByGroup[activeGroup.id] || []) : [];
+  const isActiveHubAdmin = !!(currentUser && activeGroup && currentUser.id === activeGroup.adminId);
+  const currentMembers: User[] = activeGroup ? (activeGroup.members || []) : [];
+  const isCurrentUserBanned = !!(
+    currentUser &&
+    activeGroup &&
+    (bannedByGroup[activeGroup.id] || []).includes(currentUser.id)
+  );
+
+  const handleSubmitComplaint = () => {
+    if (!currentUser || !activeGroup) return;
+    const subject = complaintSubject.trim();
+    const description = complaintDescription.trim();
+    if (!subject || !description) return;
+
+    const complaint: Complaint = {
+      id: 'C-' + Math.random().toString(36).substr(2, 9).toUpperCase(),
+      subject,
+      description,
+      createdAt: new Date(),
+      createdBy: currentUser.id,
+      reporterName: currentUser.name,
+      groupId: activeGroup.id,
+      status: 'OPEN',
+    };
+
+    setComplaintsByGroup(prev => {
+      const existing = prev[activeGroup.id] || [];
+      return { ...prev, [activeGroup.id]: [complaint, ...existing] };
+    });
+
+    setComplaintSubject('');
+    setComplaintDescription('');
+  };
+
+  const handleMarkComplaintRead = (id: string) => {
+    if (!activeGroup) return;
+    setComplaintsByGroup(prev => {
+      const existing = prev[activeGroup.id] || [];
+      const updated = existing.filter(c => c.id !== id);
+      return { ...prev, [activeGroup.id]: updated };
+    });
+  };
+
+  const handleToggleBanUser = (userId: string) => {
+    if (!activeGroup || !isActiveHubAdmin) return;
+    if (userId === currentUser?.id) return;
+    setBannedByGroup(prev => {
+      const existing = prev[activeGroup.id] || [];
+      const isBanned = existing.includes(userId);
+      const updated = isBanned ? existing.filter(id => id !== userId) : [...existing, userId];
+      return { ...prev, [activeGroup.id]: updated };
+    });
+  };
+
   if (authStep === 'LOGIN') {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 text-center">
@@ -580,6 +702,7 @@ const App: React.FC = () => {
                       key={g.id}
                       onClick={() => handleEnterHub(g.id)}
                       className="w-full flex items-center justify-between bg-slate-800 hover:bg-slate-700 transition-colors px-4 py-3 rounded-2xl text-left"
+                      type="button"
                     >
                       <div className="flex items-center space-x-3">
                         <div className="w-10 h-10 rounded-full bg-slate-700 flex items-center justify-center text-xs font-black text-slate-100">
@@ -594,6 +717,16 @@ const App: React.FC = () => {
                         <span className={`px-2 py-1 rounded-full text-[9px] font-black uppercase tracking-widest ${isAdmin ? 'bg-fuchsia-600/20 text-fuchsia-300' : 'bg-slate-700 text-slate-300'}`}>
                           {isAdmin ? 'Admin' : 'Member'}
                         </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleLeaveHub(g.id);
+                          }}
+                          className="text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full border border-slate-600 text-slate-300 hover:bg-red-900/40 hover:border-red-500 hover:text-red-200"
+                        >
+                          Leave
+                        </button>
                       </div>
                     </button>
                   );
@@ -629,12 +762,36 @@ const App: React.FC = () => {
                   <button
                     onClick={() => {
                       const user: User = currentUser || { id: 'u_' + Date.now(), name: societyUsername, email: '', role: 'ADMIN' };
+                      const hubId = 'HUB-' + Math.floor(Math.random() * 999);
+                      const trialMembers: User[] = [
+                        { id: hubId + '_trial1', name: 'Trial Member 1', email: '', role: 'USER', groupId: hubId },
+                        { id: hubId + '_trial2', name: 'Trial Member 2', email: '', role: 'USER', groupId: hubId },
+                        { id: hubId + '_trial3', name: 'Trial Member 3', email: '', role: 'USER', groupId: hubId },
+                      ];
                       const group: Group = {
-                        id: 'HUB-' + Math.floor(Math.random() * 999),
+                        id: hubId,
                         name: newGroupName || 'Sentinel Society',
                         adminId: user.id,
-                        members: [],
+                        members: [user, ...trialMembers],
                       };
+
+                      // Seed a trial complaint so the admin can test the ban feature
+                      const trialSource = trialMembers[0];
+                      const trialComplaint: Complaint = {
+                        id: 'C-TRIAL-' + Math.random().toString(36).substr(2, 5).toUpperCase(),
+                        subject: 'Trial resident complaint',
+                        description: 'Auto-created trial complaint to help you test the ban feature. You can safely ignore this entry.',
+                        createdAt: new Date(),
+                        createdBy: trialSource.id,
+                        reporterName: trialSource.name,
+                        groupId: group.id,
+                        status: 'OPEN',
+                      };
+                      setComplaintsByGroup(prev => {
+                        const existing = prev[group.id] || [];
+                        return { ...prev, [group.id]: [trialComplaint, ...existing] };
+                      });
+
                       setCurrentUser(user);
                       registerJoinedGroup(group);
                       setAuthStep('DASHBOARD');
@@ -682,12 +839,35 @@ const App: React.FC = () => {
               <button
                 onClick={() => {
                   const user: User = { id: 'u_' + Date.now(), name: societyUsername, email: '', role: 'ADMIN' };
+                  const hubId = 'HUB-' + Math.floor(Math.random() * 999);
+                  const trialMembers: User[] = [
+                    { id: hubId + '_trial1', name: 'Trial Member 1', email: '', role: 'USER', groupId: hubId },
+                    { id: hubId + '_trial2', name: 'Trial Member 2', email: '', role: 'USER', groupId: hubId },
+                    { id: hubId + '_trial3', name: 'Trial Member 3', email: '', role: 'USER', groupId: hubId },
+                  ];
                   const group: Group = {
-                    id: 'HUB-' + Math.floor(Math.random() * 999),
+                    id: hubId,
                     name: newGroupName || 'Sentinel Society',
                     adminId: user.id,
-                    members: [],
+                    members: [user, ...trialMembers],
                   };
+
+                  const trialSource = trialMembers[0];
+                  const trialComplaint: Complaint = {
+                    id: 'C-TRIAL-' + Math.random().toString(36).substr(2, 5).toUpperCase(),
+                    subject: 'Trial resident complaint',
+                    description: 'Auto-created trial complaint to help you test the ban feature. You can safely ignore this entry.',
+                    createdAt: new Date(),
+                    createdBy: trialSource.id,
+                    reporterName: trialSource.name,
+                    groupId: group.id,
+                    status: 'OPEN',
+                  };
+                  setComplaintsByGroup(prev => {
+                    const existing = prev[group.id] || [];
+                    return { ...prev, [group.id]: [trialComplaint, ...existing] };
+                  });
+
                   setCurrentUser(user);
                   registerJoinedGroup(group);
                   setAuthStep('DASHBOARD');
@@ -841,7 +1021,16 @@ const App: React.FC = () => {
           </div>
         )}
 
-        <CommandCenter onTrigger={triggerAlert} disabled={activeAlerts.length >= 8} />
+        {isCurrentUserBanned && (
+          <div className="bg-amber-100 border border-amber-200 text-amber-800 text-xs font-bold px-4 py-3 rounded-2xl flex items-center space-x-2">
+            <i className="fas fa-ban"></i>
+            <span>
+              Your profile has been restricted from triggering emergency alerts by the hub admin.
+            </span>
+          </div>
+        )}
+
+        <CommandCenter onTrigger={triggerAlert} disabled={activeAlerts.length >= 8 || isCurrentUserBanned} />
 
         <div className="bg-white rounded-[2.5rem] p-8 border border-slate-200 shadow-sm space-y-6">
           <div className="flex justify-between items-center">
@@ -957,6 +1146,161 @@ const App: React.FC = () => {
             </div>
           </div>
         )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="bg-white rounded-[2rem] p-8 border border-slate-200 shadow-sm space-y-4">
+            <div>
+              <h3 className="text-xl font-black text-slate-900 tracking-tight">File a Complaint</h3>
+              <p className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">
+                Non-emergency issues for society admins
+              </p>
+            </div>
+            <input
+              value={complaintSubject}
+              onChange={(e) => setComplaintSubject(e.target.value)}
+              placeholder="Subject (e.g., Noise after 11PM)"
+              className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-fuchsia-500"
+            />
+            <textarea
+              value={complaintDescription}
+              onChange={(e) => setComplaintDescription(e.target.value)}
+              placeholder="Describe the issue with as much detail as possible..."
+              className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-sm h-32 resize-none focus:outline-none focus:ring-2 focus:ring-fuchsia-500"
+            />
+            <button
+              onClick={handleSubmitComplaint}
+              disabled={!complaintSubject.trim() || !complaintDescription.trim() || !currentUser || !activeGroup}
+              className="w-full bg-slate-900 text-white py-3 rounded-2xl font-black text-xs uppercase tracking-widest disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-800 transition-colors"
+            >
+              Submit Complaint
+            </button>
+          </div>
+
+          <div className="bg-white rounded-[2rem] p-8 border border-slate-200 shadow-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-xl font-black text-slate-900 tracking-tight">
+                  {isActiveHubAdmin ? 'Resident Complaints Inbox' : 'Your Filed Complaints'}
+                </h3>
+                <p className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">This hub only</p>
+              </div>
+              <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+                {currentComplaints.length} total • {currentUser ? (isActiveHubAdmin ? 'Admin View' : 'Resident View') : 'Guest'}
+              </span>
+            </div>
+            {currentComplaints.length === 0 ? (
+              <div className="py-10 text-center text-slate-400 text-xs font-bold uppercase tracking-widest">
+                No complaints filed yet
+              </div>
+            ) : (
+              <div className="space-y-3 max-h-64 overflow-y-auto pr-1">
+                {(isActiveHubAdmin
+                  ? currentComplaints
+                  : currentComplaints.filter(c => c.createdBy === currentUser?.id)
+                ).map((c) => (
+                  <div
+                    key={c.id}
+                    className="p-4 rounded-2xl border border-slate-100 bg-slate-50 flex flex-col space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-bold text-slate-900 truncate mr-2">{c.subject}</span>
+                      <div className="flex items-center space-x-2">
+                        <span className="text-[9px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">
+                          Unread
+                        </span>
+                        <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">
+                          {c.createdAt.toLocaleDateString()} • {c.createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                        <button
+                          onClick={() => setExpandedComplaintId(prev => (prev === c.id ? null : c.id))}
+                          className="text-[9px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full border border-slate-300 text-slate-600 hover:bg-slate-100"
+                        >
+                          {expandedComplaintId === c.id ? 'Hide' : 'Read'}
+                        </button>
+                      </div>
+                    </div>
+                    <p className={`text-xs text-slate-600 ${expandedComplaintId === c.id ? '' : 'line-clamp-2'}`}>
+                      {c.description}
+                    </p>
+                    <div className="flex items-center justify-between">
+                      <span className="text-[9px] font-bold uppercase tracking-widest text-slate-400">
+                        Reported by {c.reporterName}
+                      </span>
+                      {isActiveHubAdmin && (
+                        <button
+                          onClick={() => handleMarkComplaintRead(c.id)}
+                          className="text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full border border-slate-300 text-slate-600 hover:bg-slate-100"
+                        >
+                          Mark as Read
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {isActiveHubAdmin && (
+            <div className="bg-white rounded-[2rem] p-8 border border-slate-200 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-xl font-black text-slate-900 tracking-tight">Hub Members</h3>
+                  <p className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">Manage alert permissions</p>
+                </div>
+                <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+                  {currentMembers.length} member{currentMembers.length === 1 ? '' : 's'}
+                </span>
+              </div>
+              {currentMembers.length === 0 ? (
+                <div className="py-10 text-center text-slate-400 text-xs font-bold uppercase tracking-widest">
+                  No members registered
+                </div>
+              ) : (
+                <div className="space-y-3 max-h-64 overflow-y-auto pr-1">
+                  {currentMembers.map((m) => {
+                    const isMemberBanned = !!(
+                      activeGroup &&
+                      (bannedByGroup[activeGroup.id] || []).includes(m.id)
+                    );
+                    const isAdminMember = m.id === activeGroup?.adminId;
+                    const canBan = !isAdminMember && m.id !== currentUser?.id;
+                    return (
+                      <div
+                        key={m.id}
+                        className="p-4 rounded-2xl border border-slate-100 bg-slate-50 flex items-center justify-between"
+                      >
+                        <div className="flex flex-col">
+                          <span className="text-sm font-bold text-slate-900">{m.name}</span>
+                          <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">
+                            {isAdminMember ? 'Admin' : 'Member'}
+                          </span>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                          <span className={`text-[9px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full ${
+                            isMemberBanned
+                              ? 'bg-red-100 text-red-700'
+                              : 'bg-emerald-100 text-emerald-700'
+                          }`}>
+                            {isMemberBanned ? 'Alerts Blocked' : 'Alerts Allowed'}
+                          </span>
+                          {canBan && (
+                            <button
+                              onClick={() => handleToggleBanUser(m.id)}
+                              className="text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full border border-red-200 text-red-600 hover:bg-red-50"
+                            >
+                              {isMemberBanned ? 'Unban' : 'Ban'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
 
         <AlertHistory alerts={allAlerts} members={[]} />
       </main>
