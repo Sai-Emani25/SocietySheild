@@ -31,35 +31,58 @@ async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: 
 }
 
 const STORAGE_KEY = 'SOCIETY_SHIELD_ALERTS_V2';
+const GROUPS_STORAGE_KEY = 'SOCIETY_SHIELD_GROUPS_V1';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [activeGroup, setActiveGroup] = useState<Group | null>(null);
-  const [authStep, setAuthStep] = useState<'LOGIN' | 'ONBOARDING' | 'DASHBOARD'>('LOGIN');
+  const [joinedGroups, setJoinedGroups] = useState<Group[]>(() => {
+    try {
+      const raw = localStorage.getItem(GROUPS_STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+  const [authStep, setAuthStep] = useState<'LOGIN' | 'AUTH' | 'ONBOARDING' | 'DASHBOARD'>('LOGIN');
   const [societyUsername, setSocietyUsername] = useState('');
   const [joinId, setJoinId] = useState('');
   const [newGroupName, setNewGroupName] = useState('');
+  const [showHubMenu, setShowHubMenu] = useState(false);
+  const [camerasByGroup, setCamerasByGroup] = useState<Record<string, Camera[]>>({});
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [newCam, setNewCam] = useState({ name: '', url: '', key: '' });
   const [isLinking, setIsLinking] = useState(false);
   const [activeCameraIndex, setActiveCameraIndex] = useState(0);
   
-  // Persistent Alerts State
-  const [allAlerts, setAllAlerts] = useState<EmergencyAlert[]>(() => {
+  // Persistent Alerts State (per hub)
+  const [alertsByGroup, setAlertsByGroup] = useState<Record<string, EmergencyAlert[]>>(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return parsed.map((a: any) => ({
-          ...a,
-          timestamp: new Date(a.timestamp),
-          resolvedAt: a.resolvedAt ? new Date(a.resolvedAt) : undefined
-        }));
-      } catch (e) { return []; }
+    if (!saved) return {};
+    try {
+      const parsed = JSON.parse(saved);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const fixed: Record<string, EmergencyAlert[]> = {};
+        Object.entries(parsed).forEach(([groupId, value]) => {
+          if (Array.isArray(value)) {
+            fixed[groupId] = (value as any[]).map((a: any) => ({
+              ...a,
+              timestamp: new Date(a.timestamp),
+              resolvedAt: a.resolvedAt ? new Date(a.resolvedAt) : undefined
+            }));
+          }
+        });
+        return fixed;
+      }
+      // Legacy flat array format is ignored for per-hub logs
+      return {};
+    } catch {
+      return {};
     }
-    return [];
   });
-  
+  const [allAlerts, setAllAlerts] = useState<EmergencyAlert[]>([]);
   const [activeAlerts, setActiveAlerts] = useState<EmergencyAlert[]>([]);
   const [evacuationAdvice, setEvacuationAdvice] = useState<Record<string, string>>({});
   const [showAdminPanel, setShowAdminPanel] = useState(false);
@@ -72,11 +95,16 @@ const App: React.FC = () => {
   const wakeLockRef = useRef<any>(null);
   const activeAlertsRef = useRef(activeAlerts);
   const isMutedRef = useRef(isMuted);
+  const googleLoginInProgressRef = useRef(false);
 
   // Persistence Sync
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(allAlerts));
-  }, [allAlerts]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(alertsByGroup));
+  }, [alertsByGroup]);
+
+  useEffect(() => {
+    localStorage.setItem(GROUPS_STORAGE_KEY, JSON.stringify(joinedGroups));
+  }, [joinedGroups]);
 
   useEffect(() => {
     activeAlertsRef.current = activeAlerts;
@@ -86,8 +114,48 @@ const App: React.FC = () => {
     isMutedRef.current = isMuted;
   }, [isMuted]);
 
-  // Cleanup and Monthly Report Logic
+  // Per-hub alert linkage
   useEffect(() => {
+    if (!activeGroup) {
+      setAllAlerts([]);
+      setActiveAlerts([]);
+      return;
+    }
+    const list = alertsByGroup[activeGroup.id] || [];
+    setAllAlerts(list);
+    setActiveAlerts(list.filter(a => a.status === 'ACTIVE'));
+  }, [activeGroup, alertsByGroup]);
+
+  // Per-hub camera linkage
+  useEffect(() => {
+    if (!activeGroup) {
+      setCameras([]);
+      setActiveCameraIndex(0);
+      return;
+    }
+    const existing = camerasByGroup[activeGroup.id];
+    setCameras(existing || []);
+    setActiveCameraIndex(0);
+  }, [activeGroup, camerasByGroup]);
+
+  useEffect(() => {
+    if (!activeGroup) return;
+    setCamerasByGroup(prev => ({
+      ...prev,
+      [activeGroup.id]: cameras,
+    }));
+  }, [cameras, activeGroup]);
+
+  // Cleanup and Monthly Report Logic (per active hub)
+  useEffect(() => {
+    if (!activeGroup) {
+      setPendingMonthlyReport(null);
+      return;
+    }
+
+    const groupId = activeGroup.id;
+    const groupAlerts = alertsByGroup[groupId] || [];
+
     const now = new Date();
     const currentMonth = now.getMonth();
     const currentYear = now.getFullYear();
@@ -96,18 +164,25 @@ const App: React.FC = () => {
     const thirtyDaysAgo = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
     
     // 2. Identify alerts from previous months for batch reporting
-    const previousMonthAlerts = allAlerts.filter(a => {
+    const previousMonthAlerts = groupAlerts.filter(a => {
       const d = new Date(a.timestamp);
       return d.getMonth() !== currentMonth || d.getFullYear() !== currentYear;
     });
 
     if (previousMonthAlerts.length > 0) {
       setPendingMonthlyReport(previousMonthAlerts);
+    } else {
+      setPendingMonthlyReport(null);
     }
 
     // Auto-delete alerts that are strictly more than 30 days old regardless of month
-    setAllAlerts(prev => prev.filter(a => new Date(a.timestamp) > thirtyDaysAgo));
-  }, []);
+    setAlertsByGroup(prev => {
+      const existing = prev[groupId] || [];
+      const filtered = existing.filter(a => new Date(a.timestamp) > thirtyDaysAgo);
+      if (filtered.length === existing.length) return prev;
+      return { ...prev, [groupId]: filtered };
+    });
+  }, [alertsByGroup, activeGroup]);
 
   const downloadReport = (alertsToExport: EmergencyAlert[], fileName: string) => {
     const data = JSON.stringify(alertsToExport, null, 2);
@@ -123,14 +198,70 @@ const App: React.FC = () => {
   };
 
   const handleArchivePreviousMonth = () => {
-    if (!pendingMonthlyReport) return;
+    if (!pendingMonthlyReport || !activeGroup) return;
     const lastMonthName = new Date(pendingMonthlyReport[0].timestamp).toLocaleString('default', { month: 'long', year: 'numeric' });
     downloadReport(pendingMonthlyReport, `SocietyShield_Report_${lastMonthName.replace(' ', '_')}.json`);
     
-    // Clear them from state after download
+    // Clear them from state after download for the active hub
     const reportIds = new Set(pendingMonthlyReport.map(a => a.id));
-    setAllAlerts(prev => prev.filter(a => !reportIds.has(a.id)));
+    const groupId = activeGroup.id;
+    setAlertsByGroup(prev => {
+      const existing = prev[groupId] || [];
+      const filtered = existing.filter(a => !reportIds.has(a.id));
+      return { ...prev, [groupId]: filtered };
+    });
     setPendingMonthlyReport(null);
+  };
+
+  const handleGoogleLogin = () => {
+    const clientId = process.env.GOOGLE_CLIENT_ID || '';
+    if (!clientId) {
+      setAuthStep('ONBOARDING');
+      return;
+    }
+    if (googleLoginInProgressRef.current) return;
+    const google = (window as any).google;
+    if (!google?.accounts?.oauth2) {
+      setAuthStep('ONBOARDING');
+      return;
+    }
+    googleLoginInProgressRef.current = true;
+    const client = google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: 'openid profile email',
+      callback: async (tokenResponse: any) => {
+        try {
+          const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+            headers: { Authorization: `Bearer ${tokenResponse.access_token}` },
+          });
+          const profile = await res.json();
+          const name = profile.name || profile.email || 'Resident';
+          const email = profile.email || '';
+          const userId = profile.sub ? `google_${profile.sub}` : `google_${Date.now()}`;
+          setCurrentUser(prev => {
+            const existingRole = prev?.role || 'USER';
+            return { id: userId, name, email, role: existingRole };
+          });
+          setSocietyUsername(name);
+          setAuthStep('ONBOARDING');
+        } catch (e) {
+          console.error('Google login failed', e);
+          setAuthStep('ONBOARDING');
+        } finally {
+          googleLoginInProgressRef.current = false;
+        }
+      },
+    });
+    client.requestAccessToken({ prompt: 'consent' });
+  };
+
+  const registerJoinedGroup = (group: Group) => {
+    setJoinedGroups(prev => {
+      const exists = prev.some(g => g.id === group.id);
+      if (exists) return prev;
+      return [...prev, group];
+    });
+    setActiveGroup(group);
   };
 
   const initAudio = () => {
@@ -286,8 +417,11 @@ const App: React.FC = () => {
       description: `Emergency ${type.toLowerCase()} broadcast.`,
       triggeredBy: currentUser.id
     };
-    setAllAlerts(prev => [newAlert, ...prev]);
-    setActiveAlerts(prev => [...prev, newAlert]);
+    const groupId = activeGroup.id;
+    setAlertsByGroup(prev => {
+      const existing = prev[groupId] || [];
+      return { ...prev, [groupId]: [newAlert, ...existing] };
+    });
     const advice = await getEvacuationPlan(type, currentUser.name);
     setEvacuationAdvice(prev => ({ ...prev, [newAlert.id]: advice }));
     if (activeAlertsRef.current.length === 0) {
@@ -303,13 +437,19 @@ const App: React.FC = () => {
   };
 
   const resolveAlert = (id: string) => {
-    const alertToResolve = activeAlerts.find(a => a.id === id);
+    if (!activeGroup) return;
+    const groupId = activeGroup.id;
+    const groupAlerts = alertsByGroup[groupId] || [];
+    const alertToResolve = groupAlerts.find(a => a.id === id);
     if (!alertToResolve) return;
     if (alertToResolve.triggeredBy !== currentUser?.id) return;
     playSystemSound('OFF');
-    setAllAlerts(prev => prev.map(a => a.id === id ? { ...a, status: 'RESOLVED', resolvedAt: new Date() } : a));
-    const remainingAlerts = activeAlerts.filter(a => a.id !== id);
-    setActiveAlerts(remainingAlerts);
+    setAlertsByGroup(prev => {
+      const existing = prev[groupId] || [];
+      const updated = existing.map(a => a.id === id ? { ...a, status: 'RESOLVED', resolvedAt: new Date() } : a);
+      return { ...prev, [groupId]: updated };
+    });
+    const remainingAlerts = groupAlerts.filter(a => a.id !== id && a.status === 'ACTIVE');
     if (remainingAlerts.length > 0) {
       speak("Threat level decreased.");
     } else {
@@ -343,14 +483,76 @@ const App: React.FC = () => {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const handleSwitchHub = (groupId: string) => {
+    const found = joinedGroups.find(g => g.id === groupId);
+    if (!found) return;
+    setActiveGroup(found);
+  };
+
+  const handleLeaveHub = (groupId: string) => {
+    setJoinedGroups(prev => {
+      const updated = prev.filter(g => g.id !== groupId);
+      if (activeGroup && activeGroup.id === groupId) {
+        const nextActive = updated[0] || null;
+        setActiveGroup(nextActive);
+        if (!nextActive) {
+          setAuthStep('ONBOARDING');
+        }
+      }
+      return updated;
+    });
+  };
+
+  const handleEnterHub = (groupId: string) => {
+    const found = joinedGroups.find(g => g.id === groupId);
+    if (!found) return;
+    if (!currentUser) {
+      const name = societyUsername || 'Resident';
+      const user: User = { id: 'u_' + Date.now(), name, email: '', role: 'USER' };
+      setCurrentUser(user);
+    }
+    setActiveGroup(found);
+    setAuthStep('DASHBOARD');
+  };
+
+  const handleManageHubs = () => {
+    if (currentUser) {
+      setSocietyUsername(currentUser.name);
+    }
+    setAuthStep('ONBOARDING');
+  };
+
   if (authStep === 'LOGIN') {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 text-center">
         <div className="max-w-md w-full bg-slate-900 rounded-[2.5rem] p-10 shadow-2xl border border-slate-800 space-y-8">
           <div className="w-20 h-20 bg-fuchsia-600 rounded-3xl mx-auto flex items-center justify-center shadow-lg shadow-fuchsia-500/20"><i className="fas fa-shield-alt text-white text-4xl"></i></div>
           <h1 className="text-3xl font-black text-white tracking-tight">SocietyShield</h1>
-          <button onClick={() => setAuthStep('ONBOARDING')} className="w-full bg-white text-slate-950 h-14 rounded-2xl font-bold flex items-center justify-center space-x-3 transition-transform active:scale-95">
-             <span>Get Started</span>
+          <button onClick={() => setAuthStep('AUTH')} className="w-full bg-white text-slate-950 h-14 rounded-2xl font-bold flex items-center justify-center space-x-3 transition-transform active:scale-95">
+	         <span>Get Started</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (authStep === 'AUTH') {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
+        <div className="max-w-md w-full bg-slate-900 rounded-[2.5rem] p-10 shadow-2xl border border-slate-800 space-y-8 text-center">
+          <div className="w-16 h-16 bg-slate-800 rounded-3xl mx-auto flex items-center justify-center text-fuchsia-400">
+            <i className="fas fa-user-shield text-2xl"></i>
+          </div>
+          <div>
+            <h2 className="text-2xl font-black text-white tracking-tight">Secure your Hub</h2>
+            <p className="text-slate-400 text-xs uppercase font-bold tracking-[0.2em] mt-3">Sign in to save hubs & alerts</p>
+          </div>
+          <button onClick={handleGoogleLogin} className="w-full bg-white text-slate-950 h-12 rounded-2xl font-bold flex items-center justify-center space-x-3 transition-transform active:scale-95">
+            <i className="fab fa-google text-lg"></i>
+            <span>Continue with Google</span>
+          </button>
+          <button onClick={() => setAuthStep('ONBOARDING')} className="w-full text-[11px] text-slate-400 mt-2 underline-offset-4 hover:underline">
+            Skip for now
           </button>
         </div>
       </div>
@@ -358,6 +560,97 @@ const App: React.FC = () => {
   }
 
   if (authStep === 'ONBOARDING') {
+    if (joinedGroups.length > 0) {
+      const sorted = [...joinedGroups].sort((a, b) => a.name.localeCompare(b.name));
+      return (
+        <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
+          <div className="max-w-5xl w-full grid grid-cols-1 md:grid-cols-[2fr,1.4fr] gap-8">
+            <div className="bg-slate-900 rounded-[2.5rem] p-8 border border-slate-800 flex flex-col">
+              <div className="mb-6 flex items-center justify-between">
+                <div>
+                  <h2 className="text-2xl font-black text-white tracking-tight">Your Hubs</h2>
+                  <p className="text-slate-400 text-[10px] uppercase font-bold tracking-[0.2em] mt-2">Tap a hub to enter</p>
+                </div>
+              </div>
+              <div className="space-y-3 overflow-y-auto pr-1 max-h-[420px]">
+                {sorted.map(g => {
+                  const isAdmin = currentUser?.id === g.adminId;
+                  return (
+                    <button
+                      key={g.id}
+                      onClick={() => handleEnterHub(g.id)}
+                      className="w-full flex items-center justify-between bg-slate-800 hover:bg-slate-700 transition-colors px-4 py-3 rounded-2xl text-left"
+                    >
+                      <div className="flex items-center space-x-3">
+                        <div className="w-10 h-10 rounded-full bg-slate-700 flex items-center justify-center text-xs font-black text-slate-100">
+                          {g.name.charAt(0).toUpperCase()}
+                        </div>
+                        <div>
+                          <div className="text-sm font-black text-white tracking-tight">{g.name}</div>
+                          <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{g.id}</div>
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <span className={`px-2 py-1 rounded-full text-[9px] font-black uppercase tracking-widest ${isAdmin ? 'bg-fuchsia-600/20 text-fuchsia-300' : 'bg-slate-700 text-slate-300'}`}>
+                          {isAdmin ? 'Admin' : 'Member'}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="space-y-6">
+              <div className="bg-slate-900 rounded-[2.5rem] p-8 border border-slate-800 text-center">
+                <h2 className="text-2xl font-black text-white mb-2 tracking-tight">Resident Identity</h2>
+                <p className="text-slate-400 text-[10px] uppercase font-bold tracking-[0.2em] mb-6">Identifies all alerts you trigger</p>
+                <input value={societyUsername} onChange={(e) => setSocietyUsername(e.target.value)} placeholder="Full Name (e.g., Alex Johnson)" className="w-full bg-slate-800 border border-slate-700 h-14 rounded-2xl px-6 text-white font-bold text-center focus:border-fuchsia-500 outline-none transition-all" />
+              </div>
+              <div className="bg-slate-900 rounded-[2.5rem] p-8 border border-slate-800 space-y-4">
+                <h3 className="text-sm font-black text-white uppercase tracking-[0.2em]">Add Another Hub</h3>
+                <div className={`space-y-3 ${!societyUsername && 'opacity-50 pointer-events-none'}`}>
+                  <input value={joinId} onChange={(e) => setJoinId(e.target.value)} placeholder="Network ID" className="w-full bg-slate-800 border border-slate-700 h-12 rounded-2xl px-4 text-white text-center text-sm" />
+                  <button
+                    onClick={() => {
+                      const user: User = currentUser || { id: 'u_' + Date.now(), name: societyUsername, email: '', role: 'USER' };
+                      const group: Group = { id: joinId || 'SHIELD-01', name: 'Skyline Community', adminId: 'a1', members: [] };
+                      setCurrentUser(user);
+                      registerJoinedGroup(group);
+                      setAuthStep('DASHBOARD');
+                    }}
+                    className="w-full bg-blue-600 text-white h-11 rounded-2xl font-bold text-sm"
+                  >
+                    Join Network
+                  </button>
+                </div>
+                <div className={`border-t border-slate-800 pt-4 mt-2 space-y-3 ${!societyUsername && 'opacity-50 pointer-events-none'}`}>
+                  <input value={newGroupName} onChange={(e) => setNewGroupName(e.target.value)} placeholder="New Hub Name" className="w-full bg-slate-800 border border-slate-700 h-12 rounded-2xl px-4 text-white text-center text-sm" />
+                  <button
+                    onClick={() => {
+                      const user: User = currentUser || { id: 'u_' + Date.now(), name: societyUsername, email: '', role: 'ADMIN' };
+                      const group: Group = {
+                        id: 'HUB-' + Math.floor(Math.random() * 999),
+                        name: newGroupName || 'Sentinel Society',
+                        adminId: user.id,
+                        members: [],
+                      };
+                      setCurrentUser(user);
+                      registerJoinedGroup(group);
+                      setAuthStep('DASHBOARD');
+                    }}
+                    className="w-full bg-fuchsia-600 text-white h-11 rounded-2xl font-bold text-sm"
+                  >
+                    Create Hub
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
         <div className="max-w-4xl w-full space-y-8">
@@ -370,12 +663,39 @@ const App: React.FC = () => {
              <div className={`bg-slate-900 rounded-[2.5rem] p-10 border border-slate-800 space-y-6 ${!societyUsername && 'opacity-50 pointer-events-none'}`}>
               <h2 className="text-2xl font-black text-white">Join Sector</h2>
               <input value={joinId} onChange={(e) => setJoinId(e.target.value)} placeholder="Network ID" className="w-full bg-slate-800 border border-slate-700 h-14 rounded-2xl px-6 text-white text-center" />
-              <button onClick={() => { setCurrentUser({ id: 'u_' + Date.now(), name: societyUsername, email: '', role: 'USER' }); setActiveGroup({ id: joinId || 'SHIELD-01', name: 'Skyline Community', adminId: 'a1', members: [] }); setAuthStep('DASHBOARD'); }} className="w-full bg-blue-600 text-white h-14 rounded-2xl font-bold">Join Network</button>
+              <button
+                onClick={() => {
+                  const user: User = { id: 'u_' + Date.now(), name: societyUsername, email: '', role: 'USER' };
+                  const group: Group = { id: joinId || 'SHIELD-01', name: 'Skyline Community', adminId: 'a1', members: [] };
+                  setCurrentUser(user);
+                  registerJoinedGroup(group);
+                  setAuthStep('DASHBOARD');
+                }}
+                className="w-full bg-blue-600 text-white h-14 rounded-2xl font-bold"
+              >
+                Join Network
+              </button>
             </div>
             <div className={`bg-slate-900 rounded-[2.5rem] p-10 border border-fuchsia-500/20 space-y-6 ${!societyUsername && 'opacity-50 pointer-events-none'}`}>
               <h2 className="text-2xl font-black text-white">New Hub</h2>
               <input value={newGroupName} onChange={(e) => setNewGroupName(e.target.value)} placeholder="Society Name" className="w-full bg-slate-800 border border-slate-700 h-14 rounded-2xl px-6 text-white text-center" />
-              <button onClick={() => { setCurrentUser({ id: 'u_' + Date.now(), name: societyUsername, email: '', role: 'ADMIN' }); setActiveGroup({ id: 'HUB-' + Math.floor(Math.random() * 999), name: newGroupName || 'Sentinel Society', adminId: 'u1', members: [] }); setAuthStep('DASHBOARD'); }} className="w-full bg-fuchsia-600 text-white h-14 rounded-2xl font-bold">Create Hub</button>
+              <button
+                onClick={() => {
+                  const user: User = { id: 'u_' + Date.now(), name: societyUsername, email: '', role: 'ADMIN' };
+                  const group: Group = {
+                    id: 'HUB-' + Math.floor(Math.random() * 999),
+                    name: newGroupName || 'Sentinel Society',
+                    adminId: user.id,
+                    members: [],
+                  };
+                  setCurrentUser(user);
+                  registerJoinedGroup(group);
+                  setAuthStep('DASHBOARD');
+                }}
+                className="w-full bg-fuchsia-600 text-white h-14 rounded-2xl font-bold"
+              >
+                Create Hub
+              </button>
             </div>
           </div>
         </div>
@@ -398,12 +718,116 @@ const App: React.FC = () => {
           <div className="w-9 h-9 bg-slate-900 rounded-xl flex items-center justify-center shadow-lg"><i className="fas fa-shield-alt text-white"></i></div>
           <span className="text-xl font-black tracking-tight">Society<span className="text-fuchsia-600">Shield</span></span>
         </div>
-        <button onClick={() => setShowAdminPanel(!showAdminPanel)} className="text-xs font-bold px-4 py-2 rounded-full border border-slate-200 hover:bg-slate-50 transition-all">
-          <i className="fas fa-satellite mr-2"></i> OBS PROVISIONING
-        </button>
+        <div className="relative flex items-center space-x-3">
+          {activeGroup && (
+            <button
+              onClick={() => setShowHubMenu(prev => !prev)}
+              className="text-xs font-bold px-4 py-2 rounded-full border border-slate-200 bg-white hover:bg-slate-50 transition-all flex items-center shadow-sm"
+            >
+              <i className="fas fa-layer-group mr-2 text-slate-500"></i>
+              <span className="mr-2 truncate max-w-[140px]">{activeGroup.name}</span>
+              <i className={`fas fa-chevron-${showHubMenu ? 'up' : 'down'} text-[10px] text-slate-400`}></i>
+            </button>
+          )}
+          {joinedGroups.length > 0 && (
+            <button onClick={handleManageHubs} className="hidden md:inline-flex text-xs font-bold px-4 py-2 rounded-full border border-slate-200 hover:bg-slate-50 transition-all items-center">
+              <span className="mr-1">Manage</span>
+              <i className="fas fa-pen text-[11px]"></i>
+            </button>
+          )}
+          <button onClick={() => setShowAdminPanel(!showAdminPanel)} className="text-xs font-bold px-4 py-2 rounded-full border border-slate-200 hover:bg-slate-50 transition-all">
+            <i className="fas fa-satellite mr-2"></i> OBS PROVISIONING
+          </button>
+          {showHubMenu && joinedGroups.length > 0 && (
+            <div className="absolute right-0 top-12 mt-1 w-64 bg-white border border-slate-200 rounded-2xl shadow-xl z-50 overflow-hidden">
+              <div className="px-4 py-2 text-[10px] font-black uppercase tracking-[0.2em] text-slate-400 bg-slate-50">Switch Hub</div>
+              <div className="max-h-64 overflow-y-auto py-1">
+                {joinedGroups.map(g => {
+                  const isActive = activeGroup?.id === g.id;
+                  return (
+                    <button
+                      key={g.id}
+                      onClick={() => {
+                        handleSwitchHub(g.id);
+                        setShowHubMenu(false);
+                      }}
+                      disabled={isActive}
+                      className={`w-full flex items-center justify-between px-4 py-2 text-xs border-b border-slate-50 last:border-b-0 ${
+                        isActive ? 'bg-slate-900 text-white cursor-default' : 'bg-white hover:bg-slate-50 text-slate-700'
+                      }`}
+                    >
+                      <div className="flex flex-col items-start">
+                        <span className="font-black truncate max-w-[150px]">{g.name}</span>
+                        <span className="text-[9px] text-slate-400 font-bold uppercase tracking-widest">{g.id}</span>
+                      </div>
+                      {isActive && <span className="text-[9px] font-black uppercase tracking-widest text-emerald-400">Active</span>}
+                    </button>
+                  );
+                })}
+              </div>
+              <button
+                onClick={() => {
+                  setShowHubMenu(false);
+                  handleManageHubs();
+                }}
+                className="w-full px-4 py-2 text-[10px] font-black uppercase tracking-[0.2em] text-fuchsia-600 bg-fuchsia-50 hover:bg-fuchsia-100 border-t border-fuchsia-100"
+              >
+                View / Add Hubs
+              </button>
+            </div>
+          )}
+        </div>
       </nav>
 
       <main className="max-w-6xl mx-auto px-6 py-8 space-y-8">
+        {currentUser && joinedGroups.length > 0 && (
+          <div className="bg-slate-900 text-white rounded-[2.5rem] p-6 border border-slate-800 shadow-xl flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div>
+              <h3 className="text-sm font-black uppercase tracking-[0.2em] text-slate-400">Your Hubs</h3>
+              <p className="text-xs text-slate-300 mt-1">Switch, leave, or manage the societies you are connected to.</p>
+              <button
+                onClick={handleManageHubs}
+                className="mt-3 inline-flex items-center px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest bg-white text-slate-900 hover:bg-slate-100"
+              >
+                <i className="fas fa-layer-group mr-2"></i>
+                View / Add Hubs
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-3">
+              {joinedGroups.map((g) => {
+                const isActive = activeGroup?.id === g.id;
+                const canDelete = currentUser.role === 'ADMIN' && g.adminId === currentUser.id;
+                return (
+                  <div key={g.id} className="flex items-center space-x-2 bg-slate-800 rounded-2xl px-4 py-2 text-xs font-bold uppercase tracking-widest border border-slate-700">
+                    <span className="text-slate-200">{g.name}</span>
+                    <span className="text-[9px] text-slate-500">{g.id}</span>
+                    <button
+                      onClick={() => handleSwitchHub(g.id)}
+                      disabled={isActive}
+                      className={`ml-2 px-3 py-1 rounded-full text-[9px] font-black ${isActive ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/40 cursor-default' : 'bg-white text-slate-900 hover:bg-slate-100'}`}
+                    >
+                      Switch
+                    </button>
+                    <button
+                      onClick={() => handleLeaveHub(g.id)}
+                      className="px-3 py-1 rounded-full text-[9px] font-black bg-slate-900 text-slate-300 hover:text-red-300 hover:bg-red-900/40"
+                    >
+                      Leave
+                    </button>
+                    {canDelete && (
+                      <button
+                        onClick={() => handleLeaveHub(g.id)}
+                        className="px-3 py-1 rounded-full text-[9px] font-black bg-red-600 text-white hover:bg-red-500"
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
         {pendingMonthlyReport && (
           <div className="bg-fuchsia-600 text-white p-6 rounded-[2rem] flex items-center justify-between animate-pulse shadow-xl shadow-fuchsia-500/30">
             <div className="flex items-center space-x-4">
