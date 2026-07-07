@@ -1,31 +1,12 @@
 
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { AlertType } from "../types";
 
-const FALLBACK_MESSAGE = (alertType: AlertType, triggererName: string) =>
-  `EMERGENCY: ${alertType} reported by ${triggererName}. Neighbors have been notified. Please follow safety protocols immediately.`;
-
-const createClient = () => {
-  const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY || "";
-  if (!apiKey || apiKey === "undefined") {
-    return null;
-  }
-  try {
-    return new GoogleGenAI({ apiKey });
-  } catch (err) {
-    console.error("Gemini client init failed", err);
-    return null;
-  }
-};
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
 
 export const getEvacuationPlan = async (alertType: AlertType, triggererName: string) => {
-  const client = createClient();
-  if (!client) {
-    return FALLBACK_MESSAGE(alertType, triggererName);
-  }
-
   try {
-    const response = await client.models.generateContent({
+    const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
       contents: `Generate a brief, authoritative emergency instruction for a ${alertType} alert reported by resident ${triggererName}.
       Contexts for Residential Safety:
@@ -49,6 +30,6 @@ export const getEvacuationPlan = async (alertType: AlertType, triggererName: str
     return response.text;
   } catch (error) {
     console.error("Gemini Advice Error:", error);
-    return FALLBACK_MESSAGE(alertType, triggererName);
+    return `EMERGENCY: ${alertType} reported by ${triggererName}. Neighbors have been notified. Please follow safety protocols immediately.`;
   }
 };
